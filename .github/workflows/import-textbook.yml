@@ -1,0 +1,78 @@
+name: Import Textbook
+on:
+  workflow_dispatch:
+    inputs:
+      archive_url:
+        description: 'Public HTTPS URL of textbook ZIP (must contain assets/books/<book-id>/*.webp)'
+        required: true
+        type: string
+      book_id:
+        description: 'Book folder name, e.g. chinese-8'
+        required: true
+        default: chinese-8
+        type: string
+      expected_pages:
+        description: 'Expected number of WebP pages'
+        required: true
+        default: '154'
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: textbook-import
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Download, validate and extract
+        env:
+          ARCHIVE_URL: ${{ inputs.archive_url }}
+          BOOK_ID: ${{ inputs.book_id }}
+          EXPECTED_PAGES: ${{ inputs.expected_pages }}
+        run: |
+          python3 - <<'PY'
+          import os,re,sys,zipfile,urllib.request,pathlib,tempfile
+          url=os.environ['ARCHIVE_URL'].strip()
+          book=os.environ['BOOK_ID'].strip()
+          expected=int(os.environ['EXPECTED_PAGES'])
+          if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}',book): sys.exit('Invalid book_id')
+          if not url.startswith('https://'): sys.exit('HTTPS URL required')
+          if not 1<=expected<=1000: sys.exit('Invalid page count')
+          req=urllib.request.Request(url,headers={'User-Agent':'ClassroomArchiveImporter/1.0'})
+          with urllib.request.urlopen(req,timeout=60) as resp:
+            payload=resp.read(80*1024*1024+1)
+          if len(payload)>80*1024*1024: sys.exit('ZIP too large')
+          with tempfile.NamedTemporaryFile(suffix='.zip') as tmp:
+            tmp.write(payload);tmp.flush()
+            with zipfile.ZipFile(tmp.name) as z:
+              prefix=f'assets/books/{book}/'
+              files=[x for x in z.infolist() if x.filename.startswith(prefix) and not x.is_dir()]
+              if len(files)!=expected: sys.exit(f'Expected {expected} files, got {len(files)}')
+              expected_names={prefix+f'{i:03d}.webp' for i in range(1,expected+1)}
+              if {x.filename for x in files}!=expected_names: sys.exit('Unexpected filenames or missing pages')
+              if sum(x.file_size for x in files)>100*1024*1024: sys.exit('Uncompressed images too large')
+              dest=pathlib.Path(prefix);dest.mkdir(parents=True,exist_ok=True)
+              for entry in files:
+                data=z.read(entry)
+                if not data.startswith(b'RIFF') or data[8:12]!=b'WEBP': sys.exit('Invalid WebP: '+entry.filename)
+                (dest/pathlib.Path(entry.filename).name).write_bytes(data)
+          print(f'Imported {len(files)} pages for {book}')
+          PY
+      - name: Commit textbook images
+        env:
+          BOOK_ID: ${{ inputs.book_id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "assets/books/$BOOK_ID/"
+          if git diff --cached --quiet; then
+            echo "No image changes."
+          else
+            git commit -m "content: import textbook $BOOK_ID scanned pages"
+            git push
+          fi
